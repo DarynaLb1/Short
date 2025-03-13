@@ -4,210 +4,257 @@ from datetime import datetime, timedelta
 import logging
 import sys
 import os
-from typing import Dict, Optional
+from typing import Dict, Optional, Union
 import json
+from pathlib import Path
 
-# Setup logging
+# Setup logging with rotation
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('mexc_short_bot.log'),
+        logging.handlers.RotatingFileHandler(
+            'mexc_short_bot.log',
+            maxBytes=10*1024*1024,  # 10MB
+            backupCount=5
+        ),
         logging.StreamHandler(sys.stdout)
     ]
 )
 logger = logging.getLogger(__name__)
 
-# Configuration class with environment variable support
 class Config:
-    API_KEY = os.getenv('MEXC_API_KEY', 'YOUR_MEXC_API_KEY')
-    API_SECRET = os.getenv('MEXC_API_SECRET', 'YOUR_MEXC_API_SECRET')
-    SYMBOL = os.getenv('MEXC_SYMBOL', 'BTC_USDT')  # Default BTC/USDT
-    MARGIN = float(os.getenv('MEXC_MARGIN', 1000))  # Margin in USDT
-    LEVERAGE = int(os.getenv('MEXC_LEVERAGE', 10))  # Leverage (1-400x)
-    PURCHASE_HOUR = int(os.getenv('MEXC_PURCHASE_HOUR', 15))  # UTC hour (0-23)
-    STOP_LOSS_PERCENT = float(os.getenv('MEXC_STOP_LOSS', 5.0))  # 5% stop loss
-    RETRY_DELAY = 300  # Seconds to wait after error
-    MAX_RETRIES = 3  # Max retries per attempt
+    """Configuration class with environment variable support and validation"""
+    API_KEY = os.getenv('MEXC_API_KEY')
+    API_SECRET = os.getenv('MEXC_API_SECRET')
+    SYMBOL = os.getenv('MEXC_SYMBOL', 'BTC_USDT')
+    MARGIN = float(os.getenv('MEXC_MARGIN', '1000'))
+    LEVERAGE = int(os.getenv('MEXC_LEVERAGE', '10'))
+    PURCHASE_HOUR = int(os.getenv('MEXC_PURCHASE_HOUR', '15'))
+    STOP_LOSS_PERCENT = float(os.getenv('MEXC_STOP_LOSS', '5.0'))
+    TAKE_PROFIT_PERCENT = float(os.getenv('MEXC_TAKE_PROFIT', '10.0'))  # New feature
+    RETRY_DELAY = int(os.getenv('MEXC_RETRY_DELAY', '300'))
+    MAX_RETRIES = int(os.getenv('MEXC_MAX_RETRIES', '3'))
 
-# Initialize exchange
-exchange = ccxt.mexc({
-    'apiKey': Config.API_KEY,
-    'secret': Config.API_SECRET,
-    'enableRateLimit': True,
-    'options': {'defaultType': 'future'}
-})
+    @classmethod
+    def validate(cls):
+        """Validate configuration parameters"""
+        if not cls.API_KEY or not cls.API_SECRET:
+            raise ValueError("API_KEY and API_SECRET must be set")
+        if cls.LEVERAGE < 1 or cls.LEVERAGE > 400:
+            raise ValueError("LEVERAGE must be between 1 and 400")
+        if cls.PURCHASE_HOUR < 0 or cls.PURCHASE_HOUR > 23:
+            raise ValueError("PURCHASE_HOUR must be between 0 and 23")
+        if cls.MARGIN <= 0:
+            raise ValueError("MARGIN must be positive")
+        if cls.STOP_LOSS_PERCENT <= 0:
+            raise ValueError("STOP_LOSS_PERCENT must be positive")
 
 class ShortBot:
     def __init__(self):
+        """Initialize the trading bot"""
         self.config = Config()
+        Config.validate()
+        self.exchange = ccxt.mexc({
+            'apiKey': self.config.API_KEY,
+            'secret': self.config.API_SECRET,
+            'enableRateLimit': True,
+            'options': {'defaultType': 'future'}
+        })
+        self.position_file = Path('open_position.json')
         self.load_markets()
         self.set_leverage()
-        self.position_file = 'open_position.json'
 
     def load_markets(self) -> None:
-        """Load market data"""
-        try:
-            exchange.load_markets()
-            if self.config.SYMBOL not in exchange.markets:
-                logger.error(f"Invalid symbol: {self.config.SYMBOL}")
-                sys.exit(1)
-        except Exception as e:
-            logger.error(f"Failed to load markets: {e}")
-            sys.exit(1)
+        """Load market data with retry logic"""
+        for attempt in range(self.config.MAX_RETRIES):
+            try:
+                self.exchange.load_markets()
+                if self.config.SYMBOL not in self.exchange.markets:
+                    raise ValueError(f"Invalid symbol: {self.config.SYMBOL}")
+                return
+            except Exception as e:
+                logger.error(f"Market load attempt {attempt + 1} failed: {e}")
+                if attempt == self.config.MAX_RETRIES - 1:
+                    sys.exit(1)
+                time.sleep(self.config.RETRY_DELAY)
 
     def set_leverage(self) -> None:
         """Set leverage for the symbol"""
         try:
-            exchange.private_post_futures_leverage({
+            response = self.exchange.private_post_futures_leverage({
                 'symbol': self.config.SYMBOL,
                 'leverage': self.config.LEVERAGE
             })
-            logger.info(f"Leverage set to {self.config.LEVERAGE}x for {self.config.SYMBOL}")
+            if response.get('success', False):
+                logger.info(f"Leverage set to {self.config.LEVERAGE}x for {self.config.SYMBOL}")
+            else:
+                raise ValueError("Leverage setting failed")
         except Exception as e:
             logger.error(f"Error setting leverage: {e}")
             sys.exit(1)
 
     def get_next_purchase_time(self) -> datetime:
-        """Calculate next purchase time"""
+        """Calculate next purchase time with timezone awareness"""
         now = datetime.utcnow()
         target = now.replace(hour=self.config.PURCHASE_HOUR, minute=0, second=0, microsecond=0)
         if now >= target:
             target += timedelta(days=1)
         return target
 
-    def check_balance(self) -> bool:
-        """Check if sufficient USDT balance is available"""
+    def check_balance(self) -> Optional[float]:
+        """Check and return available USDT balance"""
         try:
-            balance = exchange.fetch_balance({'type': 'future'})
+            balance = self.exchange.fetch_balance({'type': 'future'})
             usdt_balance = float(balance['total'].get('USDT', 0))
-            required = self.config.MARGIN * 1.1  # 10% buffer for fees
+            required = self.config.MARGIN * 1.1
             if usdt_balance < required:
                 logger.error(f"Insufficient balance: {usdt_balance:.2f} USDT, "
-                            f"required: {required:.2f} USDT")
-                return False
-            return True
+                           f"required: {required:.2f} USDT")
+                return None
+            return usdt_balance
         except Exception as e:
             logger.error(f"Balance check failed: {e}")
-            return False
+            return None
 
     def save_position(self, order: Dict) -> None:
-        """Save position details to file"""
-        position_data = {
-            'order_id': order['id'],
-            'symbol': self.config.SYMBOL,
-            'amount': order['amount'],
-            'price': order['price'],
-            'timestamp': order['timestamp']
-        }
-        with open(self.position_file, 'w') as f:
-            json.dump(position_data, f)
+        """Save position details to file with error handling"""
+        try:
+            position_data = {
+                'order_id': order['id'],
+                'symbol': self.config.SYMBOL,
+                'amount': order['amount'],
+                'price': order['price'],
+                'timestamp': order['timestamp'],
+                'stop_loss': order.get('stop_loss_price'),
+                'take_profit': order.get('take_profit_price')
+            }
+            self.position_file.write_text(json.dumps(position_data))
+        except Exception as e:
+            logger.error(f"Failed to save position: {e}")
 
     def open_short(self) -> bool:
-        """Open short position with retry logic"""
-        retries = 0
-        while retries < self.config.MAX_RETRIES:
-            try:
-                if not self.check_balance():
-                    return False
+        """Open short position with stop-loss and take-profit"""
+        balance = self.check_balance()
+        if not balance:
+            return False
 
-                ticker = exchange.fetch_ticker(self.config.SYMBOL)
-                current_price = ticker['last']
-                position_size = (self.config.MARGIN * self.config.LEVERAGE) / current_price
+        try:
+            ticker = self.exchange.fetch_ticker(self.config.SYMBOL)
+            current_price = ticker['last']
+            position_size = (self.config.MARGIN * self.config.LEVERAGE) / current_price
 
-                # Open short position
-                order = exchange.create_order(
-                    symbol=self.config.SYMBOL,
-                    type='market',
-                    side='sell',
-                    amount=position_size,
-                    params={
-                        'openType': 1,  # Isolated margin
-                        'positionType': 2  # Short position
-                    }
-                )
+            # Open short position
+            order = self.exchange.create_order(
+                symbol=self.config.SYMBOL,
+                type='market',
+                side='sell',
+                amount=position_size,
+                params={
+                    'openType': 1,  # Isolated margin
+                    'positionType': 2  # Short position
+                }
+            )
 
-                logger.info(f"Short opened: {order['id']} - {position_size:.4f} "
-                           f"{self.config.SYMBOL.split('_')[0]} at {current_price:.2f} USDT")
+            # Set stop-loss
+            stop_price = current_price * (1 + self.config.STOP_LOSS_PERCENT / 100)
+            stop_order = self.exchange.create_order(
+                symbol=self.config.SYMBOL,
+                type='stop_market',
+                side='buy',
+                amount=position_size,
+                params={
+                    'stopPrice': stop_price,
+                    'positionType': 2
+                }
+            )
 
-                # Set stop-loss
-                stop_price = current_price * (1 + self.config.STOP_LOSS_PERCENT / 100)
-                stop_order = exchange.create_order(
-                    symbol=self.config.SYMBOL,
-                    type='stop_market',
-                    side='buy',
-                    amount=position_size,
-                    params={
-                        'stopPrice': stop_price,
-                        'positionType': 2
-                    }
-                )
-                logger.info(f"Stop-loss set at {stop_price:.2f} USDT")
+            # Set take-profit
+            take_profit_price = current_price * (1 - self.config.TAKE_PROFIT_PERCENT / 100)
+            tp_order = self.exchange.create_order(
+                symbol=self.config.SYMBOL,
+                type='limit',
+                side='buy',
+                amount=position_size,
+                price=take_profit_price,
+                params={'positionType': 2}
+            )
 
-                self.save_position(order)
-                return True
+            order.update({
+                'stop_loss_price': stop_price,
+                'take_profit_price': take_profit_price
+            })
 
-            except Exception as e:
-                retries += 1
-                logger.error(f"Attempt {retries}/{self.config.MAX_RETRIES} failed: {e}")
-                if retries < self.config.MAX_RETRIES:
-                    time.sleep(self.config.RETRY_DELAY)
-        return False
+            logger.info(f"Short opened: {order['id']} - {position_size:.4f} "
+                       f"{self.config.SYMBOL.split('_')[0]} at {current_price:.2f} USDT")
+            logger.info(f"Stop-loss: {stop_price:.2f} USDT | Take-profit: {take_profit_price:.2f} USDT")
+            
+            self.save_position(order)
+            return True
+
+        except Exception as e:
+            logger.error(f"Failed to open short: {e}")
+            return False
 
     def check_existing_position(self) -> bool:
-        """Check if there's an open position"""
+        """Check if there's an open position with validation"""
+        if not self.position_file.exists():
+            return False
+
         try:
-            if os.path.exists(self.position_file):
-                with open(self.position_file, 'r') as f:
-                    position = json.load(f)
-                positions = exchange.fetch_positions([self.config.SYMBOL])
-                for pos in positions:
-                    if (pos['symbol'] == self.config.SYMBOL and 
-                        pos['side'] == 'short' and 
-                        float(pos['contracts']) > 0):
-                        logger.info(f"Existing short position found: {pos['contracts']} contracts")
-                        return True
-                os.remove(self.position_file)  # Clean up if position is closed
+            with self.position_file.open('r') as f:
+                position = json.load(f)
+            
+            positions = self.exchange.fetch_positions([self.config.SYMBOL])
+            for pos in positions:
+                if (pos['symbol'] == self.config.SYMBOL and 
+                    pos['side'] == 'short' and 
+                    float(pos['contracts']) > 0):
+                    return True
+            
+            self.position_file.unlink()  # Clean up if no position exists
             return False
         except Exception as e:
             logger.error(f"Error checking position: {e}")
             return False
 
     def run(self) -> None:
-        """Main execution loop"""
+        """Main execution loop with graceful shutdown"""
         logger.info(f"Short Bot started for {self.config.SYMBOL}")
-        while True:
-            try:
+        try:
+            while True:
                 if self.check_existing_position():
                     logger.info("Waiting for existing position to close")
-                    time.sleep(3600)  # Check hourly
+                    time.sleep(3600)
                     continue
 
                 next_purchase = self.get_next_purchase_time()
                 sleep_seconds = (next_purchase - datetime.utcnow()).total_seconds()
                 
                 if sleep_seconds > 0:
-                    logger.info(f"Next short scheduled for {next_purchase} UTC "
-                               f"({int(sleep_seconds/3600)} hours from now)")
+                    logger.info(f"Next short at {next_purchase} UTC "
+                               f"({int(sleep_seconds/3600)} hours)")
                     time.sleep(sleep_seconds)
                 
-                logger.info(f"Opening short at {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC")
-                success = self.open_short()
-                
-                if not success:
+                if self.open_short():
+                    logger.info("Short position opened successfully")
+                else:
                     logger.warning("Failed to open short, retrying next cycle")
                     time.sleep(self.config.RETRY_DELAY)
-                    
-            except Exception as e:
-                logger.error(f"Main loop error: {e}")
-                time.sleep(self.config.RETRY_DELAY)
+
+        except KeyboardInterrupt:
+            logger.info("Bot stopped by user")
+        except Exception as e:
+            logger.error(f"Fatal error: {e}")
+            sys.exit(1)
 
 if __name__ == "__main__":
-    # Validate configuration
-    required_configs = [Config.API_KEY, Config.API_SECRET]
-    if any("YOUR_" in config for config in required_configs):
-        logger.error("Please set MEXC_API_KEY and MEXC_API_SECRET environment variables")
+    try:
+        bot = ShortBot()
+        bot.run()
+    except ValueError as e:
+        logger.error(f"Configuration error: {e}")
         sys.exit(1)
-
-    bot = ShortBot()
-    bot.run()
+    except Exception as e:
+        logger.error(f"Startup error: {e}")
+        sys.exit(1)
